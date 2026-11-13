@@ -43,9 +43,9 @@ def frontend(source):
         "            SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_DEBUGMODE_BOOLEAN, false);")
     source = source.replace(
         "    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) {",
-        """    // The HIDAPI controller scan can stall on Windows before the window opens.
-    // Keep the Windows gamepad backends and allow an explicit HIDAPI override.
-    SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_HIDAPI, "0", SDL_HINT_DEFAULT);
+        """    // SDL's HIDAPI scan can block on the standard USB DualSense.
+    // Leave that device to Windows and keep HIDAPI available for other controllers.
+    SDL_SetHintWithPriority(SDL_HINT_HIDAPI_IGNORE_DEVICES, "0x054c/0x0ce6", SDL_HINT_DEFAULT);
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {""",
     )
     source = source.replace(
@@ -53,6 +53,24 @@ def frontend(source):
         """    if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD))
         LOG("gamepad initialization failed: %s", SDL_GetError());
     if (SDL_JoystickID *ids = SDL_GetGamepads(&count)) {""",
+    )
+    source = source.replace(
+        "    std::vector<SDL_Gamepad *> pads;",
+        """    std::vector<SDL_Gamepad *> pads;
+    auto open_gamepad = [&](SDL_JoystickID id) {
+        if (SDL_Gamepad *pad = SDL_OpenGamepad(id)) {
+            pads.push_back(pad);
+            const char *name = SDL_GetGamepadName(pad);
+            LOG("gamepad connected: %s", name ? name : "Unknown controller");
+        }
+    };""",
+    )
+    source = source.replace(
+        "            if (SDL_Gamepad *g = SDL_OpenGamepad(ids[j])) pads.push_back(g);",
+        "            open_gamepad(ids[j]);",
+    ).replace(
+        "                    if (SDL_Gamepad *g = SDL_OpenGamepad(e.gdevice.which)) pads.push_back(g);",
+        "                    open_gamepad(e.gdevice.which);",
     )
     return source
 
@@ -289,21 +307,19 @@ def gpu(source):
             u.rgba.resize(size_t(t.width) * t.height * 4);
             decode_texture(t, u.rgba.data());
         }""")
-    source = batch_buffers(source)
+    source = reuse_upload_buffer(source)
     return source.replace("int32_t(hs), int32_t(vs), 0}}",
                           "int32_t(hs), int32_t(vs), (int(source_row) + src->margin) * scale}}").replace(
         "q.last_push = vblanks.load(), q.addr = out;",
         "q.last_push = vblanks.load(), q.addr = lcd_address;")
 
 
-def batch_buffers(source):
+def reuse_upload_buffer(source):
     source = source.replace(
         "// copies pending texture, LUT, surface and vertex data to the GPU (one copy pass)",
-        """// Keep upload and vertex buffers across batches. SDL cycles their backing storage
-// when commands from an earlier batch still reference it.
+        """// Keep the transfer buffer across batches. SDL cycles its backing storage\n// when commands from an earlier batch still reference it.
 SDL_GPUTransferBuffer *batch_upload = nullptr;
-SDL_GPUBuffer *batch_vertices = nullptr;
-uint32_t upload_capacity = 0, vertex_capacity = 0;
+uint32_t upload_capacity = 0;
 
 uint32_t batch_capacity(size_t size) {
     return uint32_t(std::min<uint64_t>(UINT32_MAX, std::max<uint64_t>(65536, uint64_t(size) * 2)));
@@ -329,24 +345,9 @@ uint32_t batch_capacity(size_t size) {
     source = source.replace(
         "    auto *map = static_cast<uint8_t *>(SDL_MapGPUTransferBuffer(dev, tb, false));\n    size_t at = 0;",
         "    size_t at = 0;")
-    source = source.replace(
-        """        SDL_GPUBufferCreateInfo bi{SDL_GPU_BUFFERUSAGE_VERTEX, uint32_t(vbytes), 0};
-        *vbuf = SDL_CreateGPUBuffer(dev, &bi);
-        if (!*vbuf) out_of_gpu_memory(), *vbuf = SDL_CreateGPUBuffer(dev, &bi);""",
-        """        if (vbytes > vertex_capacity) {
-            SDL_GPUBufferCreateInfo info{SDL_GPU_BUFFERUSAGE_VERTEX, batch_capacity(vbytes), 0};
-            if (auto *larger = SDL_CreateGPUBuffer(dev, &info)) {
-                if (batch_vertices) SDL_ReleaseGPUBuffer(dev, batch_vertices);
-                batch_vertices = larger;
-                vertex_capacity = info.size;
-            }
-        }
-        *vbuf = vbytes <= vertex_capacity ? batch_vertices : nullptr;""")
-    source = source.replace("SDL_UploadToGPUBuffer(copy, &src, &dst, false);",
-                            "SDL_UploadToGPUBuffer(copy, &src, &dst, true);")
     source = source.replace("    SDL_EndGPUCopyPass(copy);\n    SDL_ReleaseGPUTransferBuffer(dev, tb);\n\n    // surface loads",
                             "    SDL_EndGPUCopyPass(copy);\n\n    // surface loads")
-    return source.replace("    if (vbuf) SDL_ReleaseGPUBuffer(dev, vbuf);\n", "")
+    return source
 
 
 def pica(source):

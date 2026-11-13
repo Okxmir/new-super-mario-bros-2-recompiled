@@ -68,7 +68,7 @@ Run the commands below one step at a time from the source folder. If a step repo
    Build-Nsmb2 Release OFF
    ```
 
-4. Run the tests. The current suite should report three passed tests.
+4. Run the tests.
 
    ```powershell
    .\scripts\run_tests.ps1 -Configuration Release

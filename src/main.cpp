@@ -108,6 +108,35 @@ int verify_texture_updates() {
     return 0;
 }
 
+int verify_display_colors() {
+    std::array<uint8_t, 8 * 8 * 2> render_target{}, scanout{};
+    constexpr uint32_t gx_rgb565 = 2u << 8 | 2u << 12;
+    struct Sample {
+        pica::Rgba color;
+        uint16_t packed;
+    };
+    constexpr std::array<Sample, 6> samples = {{
+        {{0, 0, 0, 255}, 0x0000},
+        {{132, 130, 132, 255}, 0x8410},
+        {{255, 255, 255, 255}, 0xffff},
+        {{255, 0, 0, 255}, 0xf800},
+        {{0, 255, 0, 255}, 0x07e0},
+        {{0, 0, 255, 255}, 0x001f},
+    }};
+    const auto format = pica::render_target_format(3u << 16);
+    if (pica::render_target_format(2u << 16) != pica::FB_RGB5A1)
+        fatal("PICA RGB5A1 render-target format was decoded incorrectly");
+    for (uint32_t x = 0; x < samples.size(); ++x)
+        pica::fb_encode(format, samples[x].color, render_target.data() + pica::morton8(x, 0) * 2);
+    pica::convert_transfer(render_target.data(), 8, 8, scanout.data(), 8, 8, gx_rgb565);
+    for (uint32_t x = 0; x < samples.size(); ++x) {
+        if (pica::load16(scanout.data() + x * 2) != samples[x].packed)
+            fatal("PICA RGB565 display transfer changed the packed color at pixel %u", x);
+    }
+    std::puts("PICA render targets preserve RGB565 colors through the display transfer");
+    return 0;
+}
+
 void play(const char *path) {
     const auto image = load(path);
     nsmb2::lock_save_directory(platform::state_dir());
@@ -118,6 +147,7 @@ void play(const char *path) {
 
 int main(int argc, char **argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--verify-textures") return verify_texture_updates();
+    if (argc == 2 && std::string_view(argv[1]) == "--verify-display-colors") return verify_display_colors();
     const bool verify = argc == 3 && std::string_view(argv[1]) == "--verify-startup";
     if ((argc > 2 && !verify) || (argc == 2 && std::string_view(argv[1]) == "--help")) {
         std::puts("NewSuperMarioBros2 [path to decrypted NSMB2-EUR.cxi]");

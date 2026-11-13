@@ -140,6 +140,10 @@ def filesystem(source):
 def gpu(source):
     source = source.replace('#include "shaders.inc"', '#include "shaders.inc"\n#include "nsmb2_lcd.inc"')
     source = source.replace("SPIRV_blit_lcd_frag, sizeof SPIRV_blit_lcd_frag", "nsmb2_lcd, sizeof nsmb2_lcd")
+    source = source.replace(
+        "uint32_t cfmt = (regs[COLOR_FORMAT] >> 16) & 7, dfmt = regs[DEPTH_FORMAT] & 3;",
+        "const uint32_t cfmt = render_target_format(regs[COLOR_FORMAT]);\n"
+        "    const uint32_t dfmt = regs[DEPTH_FORMAT] & 3;")
     source = source.replace("    if (in_h == 400) { // a top-screen frame is done",
                             """    // Mario's RGB565 buffers have 256 rows per column. The top
     // LCD starts 16 columns into a 416-column framebuffer.
@@ -149,18 +153,28 @@ def gpu(source):
     source = source.replace("    bool top = in_h == 400;\n", "")
     source = source.replace("    bool to_lcd = !(flags & 2) && !(flags & 0x20) && (((flags >> 12) & 7) <= 1);",
                             "    const bool to_lcd = top || bottom;")
+    source = source.replace(
+        "if (!s->depth && s->addr == p && s->width == in_w && s->height == in_h) src = s.get();",
+        "if (!s->depth && s->addr == p && s->width == in_w && s->height == in_h &&\n"
+        "            s->format == ((flags >> 8) & 7)) src = s.get();")
     source = source.replace("    int w = int(src->th >> vs), h = int(src->tw >> hs); // upright: rows of the output become columns\n    (void)out_w, (void)out_h;",
                             """    const int scale = int(src->th / in_h);
     const int w = (top ? 400 : 320) * scale, h = 240 * scale;
     const uint32_t lcd_address = out + (top ? 16 * 256 * 2 : 0);""")
     source = source.replace("    LcdFrames &f = lcd[out];", "    LcdFrames &f = lcd[lcd_address];")
+    source = source.replace("struct LcdFrames {", "struct LcdFrames {\n    uint32_t scanout_bytes = 0;")
+    source = source.replace("    LcdFrames &f = lcd[lcd_address];",
+                            "    LcdFrames &f = lcd[lcd_address];\n"
+                            "    f.scanout_bytes = uint32_t(top ? 400 : 320) * 256 * 2;")
     source = source.replace("    lcd.erase(addr); // an LCD buffer written by the CPU shows that, not an older GPU frame",
                             """    for (auto &[address, frame] : lcd) {
         const uint32_t lcd_start = to_physical(address);
-        const uint32_t span = 400 * 256 * 2;
-        if (p < uint64_t(lcd_start) + span && lcd_start < uint64_t(p) + size)
+        if (p < uint64_t(lcd_start) + frame.scanout_bytes && lcd_start < uint64_t(p) + size) {
             frame.latest = -1;
+            if (address == top_queue.addr) top_queue.reset();
+        }
     }""")
+    source = source.replace("    if (addr == top_queue.addr) top_queue.reset();\n", "")
     # A native-resolution target can be downloaded without an intermediate GPU blit.
     source = source.replace(
         between(source, "    SDL_GPUTexture *tmp = make_texture(w, h", "    SDL_GPUTransferBufferCreateInfo tbi"),
@@ -209,7 +223,9 @@ def gpu(source):
             decode_texture(t, u.rgba.data());
         }""")
     return source.replace("int32_t(hs), int32_t(vs), 0}}",
-                          "int32_t(hs), int32_t(vs), top ? 16 * scale : 0}}")
+                          "int32_t(hs), int32_t(vs), top ? 16 * scale : 0}}").replace(
+        "q.last_push = vblanks.load(), q.addr = out;",
+        "q.last_push = vblanks.load(), q.addr = lcd_address;")
 
 
 def pica(source):
@@ -562,8 +578,22 @@ def prepare(upstream, output):
         "            fps_since = now;\n"
         "            pica::SceneInfo si = pica::scene_info();").replace(
         "frames_rendered / 5.0", "frames_rendered / seconds"))
+    edit(src / "video/color.h", lambda source: source.replace(
+        "inline uint32_t fb_bpp(uint32_t format)",
+        """// The PICA render-target register swaps the two 16-bit format IDs used by GX and LCD.
+inline uint32_t render_target_format(uint32_t reg) {
+    uint32_t format = (reg >> 16) & 7;
+    if (format == 2) return FB_RGB5A1;
+    if (format == 3) return FB_RGB565;
+    return format;
+}
+
+inline uint32_t fb_bpp(uint32_t format)"""))
     edit(src / "video/gpu/gpu.cpp", gpu)
     edit(src / "video/pica.cpp", lambda source: vertex_workers(pica(source)))
+    edit(src / "video/raster.cpp", lambda source: source.replace(
+        "cur.color_format = (regs[COLOR_FORMAT] >> 16) & 7;",
+        "cur.color_format = render_target_format(regs[COLOR_FORMAT]);"))
     edit(src / "video/shader.cpp", shader)
     edit(src / "video/transfer.cpp", transfer)
     edit(src / "video/internal.h", lambda source: source.replace(

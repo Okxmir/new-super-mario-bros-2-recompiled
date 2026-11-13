@@ -94,3 +94,4 @@ target_include_directories(NewSuperMarioBros2 PRIVATE "${CMAKE_CURRENT_BINARY_DI
 
 
 add_test(NAME etc1a4_texture_updates COMMAND NewSuperMarioBros2 --verify-textures)
+add_test(NAME native_display_colors COMMAND NewSuperMarioBros2 --verify-display-colors)

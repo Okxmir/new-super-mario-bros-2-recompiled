@@ -2,10 +2,16 @@
 
 Experimental native Windows x64 port of the European Nintendo 3DS release (`CTR-P-ABEP`). The build translates the original ARM and Thumb code to C and compiles it for x64. It reads the original game resources from a local cartridge image.
 
-Install Python 3.11 or newer and the **Desktop development with C++** workload for Visual Studio, including CMake tools and the Windows SDK. Put your European cartridge image in this folder and run the following in Command Prompt.
+## Quick start
 
-```bat
-build.cmd -Cartridge "C:\FolderWhereIsTheRom\Rom.3ds" -Language en
-```
+1. Install Python 3.11 or newer and the Visual Studio **Desktop development with C++** workload. See [BUILD.md](BUILD.md) for the required components.
+2. Extract the source ZIP and open the folder that contains `build.cmd` in File Explorer. Put your decrypted European `.3ds` ROM in that folder.
+3. Type `cmd` in the File Explorer address bar and press Enter. Run this command, replacing `Yourrom.3ds` with the name of your ROM file.
 
-Open `dist/NewSuperMarioBros2.exe` after the build passes. See [BUILD.md](BUILD.md) for the eight language options and manual build steps. [PROGRESS.md](PROGRESS.md) lists the features tested so far.
+   ```bat
+   build.cmd -Cartridge "Yourrom.3ds" -Language en
+   ```
+
+4. When the build finishes, open `dist/NewSuperMarioBros2.exe`.
+
+Use `-Language fr` to play in French. See [BUILD.md](BUILD.md) for all eight languages and the manual build steps. [PROGRESS.md](PROGRESS.md) lists the features tested so far.

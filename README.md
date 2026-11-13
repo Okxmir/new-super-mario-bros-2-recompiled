@@ -5,7 +5,7 @@ Experimental native Windows x64 port of the European Nintendo 3DS release (`CTR-
 Install Python 3.11 or newer and the **Desktop development with C++** workload for Visual Studio, including CMake tools and the Windows SDK. Put your European cartridge image in this folder and run the following in Command Prompt.
 
 ```bat
-build.cmd -Language en
+build.cmd -Cartridge "C:\Games\Mario.3ds" -Language en
 ```
 
 Open `dist/NewSuperMarioBros2.exe` after the build passes. See [BUILD.md](BUILD.md) for the eight language options and manual build steps. [PROGRESS.md](PROGRESS.md) lists the features tested so far.

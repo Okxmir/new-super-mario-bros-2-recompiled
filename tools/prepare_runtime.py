@@ -28,12 +28,32 @@ def frontend(source):
                             'SDL_SetAppMetadata("New Super Mario Bros. 2", nullptr, "local.nsmb2.native")')
     source = source.replace('"Clockwork - Yo-kai Watch 2"', '"New Super Mario Bros. 2"')
     source = source.replace('"Clockwork: Yo-kai Watch 2 stopped"', '"New Super Mario Bros. 2"')
+    source = source.replace('    if (!window) fatal("cannot create window: %s", SDL_GetError());',
+                            '    if (!window) fatal("cannot create window: %s", SDL_GetError());\n'
+                            '    SDL_RaiseWindow(window);')
+    source = source.replace(
+        "    SDL_SetWindowFullscreen(window, s.fullscreen); // the game's own choice, whatever the launcher was",
+        "    if (s.fullscreen) SDL_SetWindowFullscreen(window, true);\n"
+        "    SDL_RaiseWindow(window);")
     source = source.replace("    fatal_hook = show_fatal;",
                             '    if (!std::getenv("NSMB2_NO_DIALOG")) fatal_hook = show_fatal;')
     source = source.replace(
         "            SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);",
         "            SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);\n"
         "            SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_DEBUGMODE_BOOLEAN, false);")
+    source = source.replace(
+        "    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) {",
+        """    // The HIDAPI controller scan can stall on Windows before the window opens.
+    // Keep the Windows gamepad backends and allow an explicit HIDAPI override.
+    SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_HIDAPI, "0", SDL_HINT_DEFAULT);
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {""",
+    )
+    source = source.replace(
+        "    if (SDL_JoystickID *ids = SDL_GetGamepads(&count)) {",
+        """    if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD))
+        LOG("gamepad initialization failed: %s", SDL_GetError());
+    if (SDL_JoystickID *ids = SDL_GetGamepads(&count)) {""",
+    )
     return source
 
 
@@ -269,10 +289,64 @@ def gpu(source):
             u.rgba.resize(size_t(t.width) * t.height * 4);
             decode_texture(t, u.rgba.data());
         }""")
+    source = batch_buffers(source)
     return source.replace("int32_t(hs), int32_t(vs), 0}}",
                           "int32_t(hs), int32_t(vs), (int(source_row) + src->margin) * scale}}").replace(
         "q.last_push = vblanks.load(), q.addr = out;",
         "q.last_push = vblanks.load(), q.addr = lcd_address;")
+
+
+def batch_buffers(source):
+    source = source.replace(
+        "// copies pending texture, LUT, surface and vertex data to the GPU (one copy pass)",
+        """// Keep upload and vertex buffers across batches. SDL cycles their backing storage
+// when commands from an earlier batch still reference it.
+SDL_GPUTransferBuffer *batch_upload = nullptr;
+SDL_GPUBuffer *batch_vertices = nullptr;
+uint32_t upload_capacity = 0, vertex_capacity = 0;
+
+uint32_t batch_capacity(size_t size) {
+    return uint32_t(std::min<uint64_t>(UINT32_MAX, std::max<uint64_t>(65536, uint64_t(size) * 2)));
+}
+
+// copies pending texture, LUT, surface and vertex data to the GPU (one copy pass)""")
+    source = source.replace(
+        """    SDL_GPUTransferBufferCreateInfo tbi{SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, uint32_t(total), 0};
+    SDL_GPUTransferBuffer *tb = SDL_CreateGPUTransferBuffer(dev, &tbi);
+    if (!tb) out_of_gpu_memory(), tb = SDL_CreateGPUTransferBuffer(dev, &tbi);
+    if (!tb) {""",
+        """    if (total > upload_capacity && total <= UINT32_MAX) {
+        SDL_GPUTransferBufferCreateInfo info{SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, batch_capacity(total), 0};
+        if (auto *larger = SDL_CreateGPUTransferBuffer(dev, &info)) {
+            if (batch_upload) SDL_ReleaseGPUTransferBuffer(dev, batch_upload);
+            batch_upload = larger;
+            upload_capacity = info.size;
+        }
+    }
+    SDL_GPUTransferBuffer *tb = total <= upload_capacity ? batch_upload : nullptr;
+    auto *map = tb ? static_cast<uint8_t *>(SDL_MapGPUTransferBuffer(dev, tb, true)) : nullptr;
+    if (!map) {""")
+    source = source.replace(
+        "    auto *map = static_cast<uint8_t *>(SDL_MapGPUTransferBuffer(dev, tb, false));\n    size_t at = 0;",
+        "    size_t at = 0;")
+    source = source.replace(
+        """        SDL_GPUBufferCreateInfo bi{SDL_GPU_BUFFERUSAGE_VERTEX, uint32_t(vbytes), 0};
+        *vbuf = SDL_CreateGPUBuffer(dev, &bi);
+        if (!*vbuf) out_of_gpu_memory(), *vbuf = SDL_CreateGPUBuffer(dev, &bi);""",
+        """        if (vbytes > vertex_capacity) {
+            SDL_GPUBufferCreateInfo info{SDL_GPU_BUFFERUSAGE_VERTEX, batch_capacity(vbytes), 0};
+            if (auto *larger = SDL_CreateGPUBuffer(dev, &info)) {
+                if (batch_vertices) SDL_ReleaseGPUBuffer(dev, batch_vertices);
+                batch_vertices = larger;
+                vertex_capacity = info.size;
+            }
+        }
+        *vbuf = vbytes <= vertex_capacity ? batch_vertices : nullptr;""")
+    source = source.replace("SDL_UploadToGPUBuffer(copy, &src, &dst, false);",
+                            "SDL_UploadToGPUBuffer(copy, &src, &dst, true);")
+    source = source.replace("    SDL_EndGPUCopyPass(copy);\n    SDL_ReleaseGPUTransferBuffer(dev, tb);\n\n    // surface loads",
+                            "    SDL_EndGPUCopyPass(copy);\n\n    // surface loads")
+    return source.replace("    if (vbuf) SDL_ReleaseGPUBuffer(dev, vbuf);\n", "")
 
 
 def pica(source):

@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <string_view>
 
@@ -155,6 +156,11 @@ int main(int argc, char **argv) {
     }
     log_cfg::init();
     if (verify) return verify_native_startup(argv[2]);
+    if (!std::getenv("NSMB2_NO_DIALOG")) {
+        fatal_hook = [](const char *message) {
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "New Super Mario Bros. 2", message, nullptr);
+        };
+    }
     const char *base = SDL_GetBasePath();
     const auto directory = std::filesystem::path(base ? base : ".");
     auto image = directory / "NSMB2-EUR.cxi";

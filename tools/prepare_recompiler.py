@@ -13,10 +13,20 @@ def main():
     shutil.copytree(args.upstream, args.output, dirs_exist_ok=True)
     path = args.output / "discover.rs"
     source = path.read_text(encoding="utf-8")
-    original = "        Op::Udf | Op::Bkpt(_) => Flow::Stop,"
-    if source.count(original) != 1:
-        raise ValueError("Unexpected Clockwork source revision")
-    source = source.replace(original, "        Op::Udf | Op::Bkpt(_) if !conditional => Flow::Stop,")
+    replacements = {
+        "        Op::Udf | Op::Bkpt(_) => Flow::Stop,":
+            "        Op::Udf | Op::Bkpt(_) if !conditional => Flow::Stop,",
+        "        let (rejected_arm, rejected_thumb) = d.rejected_counts();": (
+            "        // The European game passes this ARM comparator to the sort at 0x0045c90c.\n"
+            "        d.add_entry(0x0039_141c, false);\n"
+            "        d.run();\n"
+            "        let (rejected_arm, rejected_thumb) = d.rejected_counts();"
+        ),
+    }
+    for original, replacement in replacements.items():
+        if source.count(original) != 1:
+            raise ValueError("Unexpected Clockwork source revision")
+        source = source.replace(original, replacement)
     path.write_text(source, encoding="utf-8")
 
 

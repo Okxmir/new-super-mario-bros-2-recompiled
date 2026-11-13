@@ -1,0 +1,12 @@
+*.3ds
+*.cci
+*.cxi
+*.cia
+*.key
+/extracted/
+/generated/
+/build/
+/dist/
+/logs/
+/userdata/
+__pycache__/

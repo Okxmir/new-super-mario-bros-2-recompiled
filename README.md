@@ -1,5 +1,7 @@
 # New Super Mario Bros. 2 Recompiled
 
+our discord : https://discord.gg/eSsxcM6E65
+
 Experimental native Windows x64 port of the European Nintendo 3DS release (`CTR-P-ABEP`). The build translates the original ARM and Thumb code to C and compiles it for x64. It reads the original game resources from a local cartridge image.
 
 ## Quick start

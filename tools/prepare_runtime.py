@@ -30,6 +30,10 @@ def frontend(source):
     source = source.replace('"Clockwork: Yo-kai Watch 2 stopped"', '"New Super Mario Bros. 2"')
     source = source.replace("    fatal_hook = show_fatal;",
                             '    if (!std::getenv("NSMB2_NO_DIALOG")) fatal_hook = show_fatal;')
+    source = source.replace(
+        "            SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);",
+        "            SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);\n"
+        "            SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_DEBUGMODE_BOOLEAN, false);")
     return source
 
 
@@ -157,8 +161,33 @@ def gpu(source):
         "if (!s->depth && s->addr == p && s->width == in_w && s->height == in_h) src = s.get();",
         "if (!s->depth && s->addr == p && s->width == in_w && s->height == in_h &&\n"
         "            s->format == ((flags >> 8) & 7)) src = s.get();")
+    source = source.replace(
+        "    const bool to_lcd = top || bottom;",
+        """    const bool to_lcd = top || bottom;
+    uint32_t source_row = top ? 16 : 0;
+    bool aliased = false;
+    if (!src && bottom) {
+        // The lower LCD can read a tile-row-aligned view into the main render target.
+        // Keep that crop on the GPU instead of downloading the entire target each frame.
+        for (auto &s : surfaces) {
+            if (s->depth || s->reload || s->format != FB_RGB565 || s->width != in_w ||
+                p <= s->addr || p >= uint64_t(s->addr) + s->bytes()) continue;
+            const uint32_t offset = p - s->addr;
+            const uint32_t pitch = s->width * s->bpp();
+            const uint32_t row = offset / pitch;
+            if (offset % (8 * pitch) || row + out_h > s->height) continue;
+            if (!src || s->last_used >= src->last_used) {
+                src = s.get();
+                source_row = row;
+                aliased = true;
+            }
+        }
+    }""")
+    source = source.replace(
+        "    flush();\n    uint32_t hs =",
+        "    flush();\n    if (aliased && overwritten(src)) return false;\n    uint32_t hs =")
     source = source.replace("    int w = int(src->th >> vs), h = int(src->tw >> hs); // upright: rows of the output become columns\n    (void)out_w, (void)out_h;",
-                            """    const int scale = int(src->th / in_h);
+                            """    const int scale = src->scale;
     const int w = (top ? 400 : 320) * scale, h = 240 * scale;
     const uint32_t lcd_address = out + (top ? 16 * 256 * 2 : 0);""")
     source = source.replace("    LcdFrames &f = lcd[out];", "    LcdFrames &f = lcd[lcd_address];")
@@ -175,6 +204,24 @@ def gpu(source):
         }
     }""")
     source = source.replace("    if (addr == top_queue.addr) top_queue.reset();\n", "")
+    source = source.replace(
+        """        SDL_GPUTexture *staging = make_texture(l.surface->width, l.surface->height, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+                                               SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        loaded.push_back(staging);
+        items.push_back({at, staging, l.surface->width, l.surface->height});""",
+        """        auto &surface = *l.surface;
+        const bool direct = surface.tw == surface.width && surface.th == surface.height;
+        SDL_GPUTexture *staging = direct ? nullptr :
+            make_texture(surface.width, surface.height, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+                         SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        loaded.push_back(staging);
+        if (direct || staging)
+            items.push_back({at, direct ? surface.tex : staging, surface.width, surface.height});
+        else
+            surface.reload = true;""")
+    source = source.replace(
+        "        Surface *s = surface_loads[i].surface;",
+        "        if (!loaded[i]) continue;\n        Surface *s = surface_loads[i].surface;")
     # A native-resolution target can be downloaded without an intermediate GPU blit.
     source = source.replace(
         between(source, "    SDL_GPUTexture *tmp = make_texture(w, h", "    SDL_GPUTransferBufferCreateInfo tbi"),
@@ -223,7 +270,7 @@ def gpu(source):
             decode_texture(t, u.rgba.data());
         }""")
     return source.replace("int32_t(hs), int32_t(vs), 0}}",
-                          "int32_t(hs), int32_t(vs), top ? 16 * scale : 0}}").replace(
+                          "int32_t(hs), int32_t(vs), (int(source_row) + src->margin) * scale}}").replace(
         "q.last_push = vblanks.load(), q.addr = out;",
         "q.last_push = vblanks.load(), q.addr = lcd_address;")
 

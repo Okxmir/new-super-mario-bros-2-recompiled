@@ -307,6 +307,31 @@ def gpu(source):
             u.rgba.resize(size_t(t.width) * t.height * 4);
             decode_texture(t, u.rgba.data());
         }""")
+    source = source.replace(
+        "    tri_ids.push_back(tri);",
+        "    if (interp_on) tri_ids.push_back(tri);",
+    )
+    source = source.replace("#include <cmath>", "#include <cmath>\n#include <immintrin.h>")
+    source = source.replace(
+        """            float x0 = v0.a[POS] / w0, y0 = v0.a[POS + 1] / w0, x1 = v1.a[POS] / w1, y1 = v1.a[POS + 1] / w1;
+            float x2 = v2.a[POS] / w2, y2 = v2.a[POS + 1] / w2;""",
+        """            alignas(16) float xy[4], last[4];
+            _mm_store_ps(xy, _mm_div_ps(_mm_setr_ps(v0.a[POS], v0.a[POS + 1], v1.a[POS], v1.a[POS + 1]),
+                                      _mm_setr_ps(w0, w0, w1, w1)));
+            _mm_store_ps(last, _mm_div_ps(_mm_setr_ps(v2.a[POS], v2.a[POS + 1], 0.0f, 0.0f), _mm_set1_ps(w2)));
+            const float x0 = xy[0], y0 = xy[1], x1 = xy[2], y1 = xy[3], x2 = last[0], y2 = last[1];""",
+    )
+    source = source.replace(
+        """        for (int c = 0; c < 4; c++) g.color[c] = a[COLOR + c], g.quat[c] = a[QUAT + c];
+        g.tc01[0] = a[TEX0], g.tc01[1] = a[TEX0 + 1], g.tc01[2] = a[TEX1], g.tc01[3] = a[TEX1 + 1];""",
+        """        _mm_storeu_ps(g.color, _mm_loadu_ps(a + COLOR));
+        _mm_storeu_ps(g.quat, _mm_loadu_ps(a + QUAT));
+        _mm_storeu_ps(g.tc01, _mm_loadu_ps(a + TEX0));""",
+    )
+    source = source.replace(
+        "    for (auto &l : surface_loads) reloaded.push_back(l.surface);",
+        "    if (interp_this) for (auto &l : surface_loads) reloaded.push_back(l.surface);",
+    )
     source = reuse_upload_buffer(source)
     return source.replace("int32_t(hs), int32_t(vs), 0}}",
                           "int32_t(hs), int32_t(vs), (int(source_row) + src->margin) * scale}}").replace(
@@ -365,7 +390,8 @@ def pica(source):
                             "Vertex shade(const Vec4 attrs[16], const OutputMap &map, CompiledVertex compiled = nullptr) {")
     source = source.replace("    run_shader(vs, regs[VS_ENTRY] & 0xFFFF, in, out);",
                             """    if (compiled) {
-        Vec4 scratch[16]{};
+        // Generated code supplies zero for unwritten temporaries.
+        Vec4 scratch[16];
         compiled(vs.f, in, out, scratch);
     } else {
         run_shader(vs, regs[VS_ENTRY] & 0xFFFF, in, out);
@@ -399,6 +425,76 @@ def pica(source):
         v.a[component.semantic] = out[component.reg][component.channel];
     }
 """)
+    source = source.replace(
+        "            for (uint32_t c = 0; c < a.count; c++) {",
+        """            if (a.type == 3) {
+                // Float vertex arrays dominate Mario's meshes. Load exactly
+                // the declared components, including tightly packed XYZ.
+                switch (a.count) {
+                    case 4: std::memcpy(v.v, p, 16); break;
+                    case 3: std::memcpy(v.v, p, 12); break;
+                    case 2: std::memcpy(v.v, p, 8); break;
+                    default: std::memcpy(v.v, p, 4); break;
+                }
+                out[i] = v;
+                continue;
+            }
+            for (uint32_t c = 0; c < a.count; c++) {""",
+    ).replace("                default: std::memcpy(&v[c], p + 4 * c, 4);", "")
+    source = source.replace(
+        "        for (auto &e : cache) e.index = ~0u;",
+        "        if (indexed) for (auto &e : cache) e.index = ~0u;",
+    )
+    source = source.replace("#include <cmath>", "#include <cmath>\n#include <immintrin.h>")
+    source = source.replace(
+        "    for (int c = 0; c < 4; c++) v.a[COLOR + c] = std::fmin(std::fabs(v.a[COLOR + c]), 1.0f);",
+        """    const __m128 color = _mm_loadu_ps(v.a + COLOR);
+    const __m128 magnitude = _mm_andnot_ps(_mm_set1_ps(-0.0f), color);
+    // MINPS selects the second operand for NaN, matching fmin here.
+    _mm_storeu_ps(v.a + COLOR, _mm_min_ps(magnitude, _mm_set1_ps(1.0f)));""",
+    )
+    source = source.replace(
+        "    if (n >= 512) {",
+        """    if (n >= 512 && !indexed) {
+        // Sequential draws have no repeated indices to look up or restore.
+        static std::vector<Vertex> shaded;
+        shaded.resize(n);
+        const uint32_t first = regs[VERTEX_OFFSET];
+        workers().run(n, [&](size_t begin, size_t end) {
+            Vec4 attrs[16];
+            for (size_t k = begin; k < end; ++k) {
+                loader.read(first + uint32_t(k), attrs);
+                shaded[k] = shade(attrs, map);
+            }
+        });
+        for (const Vertex &v : shaded) assembler.push(v);
+        w = shaded.back().a[POS + 3];
+    } else if (n >= 512) {""",
+    )
+    source = source.replace(
+        "    void push(const Vertex &v) {",
+        """    template <class VertexAt>
+    void push_range(uint32_t count, VertexAt vertex_at) {
+        const uint32_t topology = (regs[PRIMITIVE_CONFIG] >> 8) & 3;
+        uint32_t i = 0;
+        if (topology != 1 && topology != 2 && list_count == 0) {
+            // Complete lists can be emitted directly from the shaded vertices.
+            for (; count - i >= 3; i += 3)
+                emit_triangle(vertex_at(i), vertex_at(i + 1), vertex_at(i + 2));
+        }
+        for (; i < count; ++i) push(vertex_at(i));
+    }
+
+    void push(const Vertex &v) {""",
+    ).replace(
+        "        for (const Vertex &v : shaded) assembler.push(v);",
+        "        assembler.push_range(n, [&](uint32_t i) -> const Vertex & { return shaded[i]; });",
+    ).replace(
+        "        for (uint32_t i = 0; i < n; i++) assembler.push(shaded[size_t(slot[index_at(i)])]);",
+        """        assembler.push_range(n, [&](uint32_t i) -> const Vertex & {
+            return shaded[size_t(slot[index_at(i)])];
+        });""",
+    )
     return source.replace("shade(attrs, map)", "shade(attrs, map, compiled)")
 
 
@@ -421,6 +517,14 @@ def shader(source):
 
 
 def vertex_workers(source):
+    source = source.replace("#include <thread>", "#include <thread>\n#include <bit>\n#include <windows.h>")
+    source = source.replace(
+        "        unsigned hw = std::thread::hardware_concurrency();",
+        """        unsigned hw = std::thread::hardware_concurrency();
+        DWORD_PTR allowed = 0, system = 0;
+        if (GetProcessAffinityMask(GetCurrentProcess(), &allowed, &system) && allowed)
+            hw = std::popcount(allowed);""",
+    )
     source = source.replace("#include <condition_variable>", "#include <atomic>")
     source = source.replace(between(source, "        if (lanes == 1 || count < 64)", "    void slice("),
                             """        if (lanes == 1 || count < 256) return fn(0, count);

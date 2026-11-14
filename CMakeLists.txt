@@ -13,6 +13,8 @@ endif()
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# Keep standalone builds independent of the player's installed MSVC runtime.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 set(UPSTREAM "${CMAKE_CURRENT_SOURCE_DIR}/build/upstream")
 set(RUNTIME "${CMAKE_CURRENT_BINARY_DIR}/runtime")

@@ -72,6 +72,55 @@ def frontend(source):
         "                    if (SDL_Gamepad *g = SDL_OpenGamepad(e.gdevice.which)) pads.push_back(g);",
         "                    open_gamepad(e.gdevice.which);",
     )
+    source = source.replace(
+        "constexpr int CIRCLE_MAX = 156;",
+        """constexpr int CIRCLE_MAX = 156;
+
+// SDL 3.4.0 can log a lost Vulkan swapchain and still return true from SDL_RenderPresent.
+std::atomic<bool> vulkan_device_lost{false};
+SDL_LogOutputFunction previous_sdl_log = nullptr;
+void *previous_sdl_log_data = nullptr;
+
+void SDLCALL capture_sdl_log(void *, int category, SDL_LogPriority priority, const char *message) {
+    if (category == SDL_LOG_CATEGORY_RENDER && priority >= SDL_LOG_PRIORITY_ERROR &&
+        std::strstr(message, "VK_ERROR_DEVICE_LOST"))
+        vulkan_device_lost.store(true, std::memory_order_relaxed);
+    if (previous_sdl_log) previous_sdl_log(previous_sdl_log_data, category, priority, message);
+}""",
+    )
+    source = source.replace(
+        '    SDL_SetAppMetadata(',
+        """    SDL_GetLogOutputFunction(&previous_sdl_log, &previous_sdl_log_data);
+    SDL_SetLogOutputFunction(capture_sdl_log, nullptr);
+    SDL_SetAppMetadata(""",
+        1,
+    )
+    source = source.replace(
+        """        if (!renderer && !(renderer = SDL_CreateRenderer(window, nullptr)))
+            fatal("cannot create a renderer: %s", SDL_GetError());""",
+        """        // Check Vulkan presentation while only the window exists so a
+        // startup failure can switch renderers before any game state is created.
+        if (device && (!SDL_RenderClear(renderer) || !SDL_RenderPresent(renderer) ||
+                       vulkan_device_lost.load(std::memory_order_relaxed))) {
+            LOG("Vulkan startup presentation failed: %s; retrying with Direct3D 11",
+                vulkan_device_lost.load(std::memory_order_relaxed) ? "VK_ERROR_DEVICE_LOST" : SDL_GetError());
+            SDL_DestroyRenderer(renderer);
+            SDL_DestroyGPUDevice(device);
+            renderer = nullptr;
+            device = nullptr;
+        }
+        if (!renderer && !(renderer = SDL_CreateRenderer(window, "direct3d11")) &&
+            !(renderer = SDL_CreateRenderer(window, "software")))
+            fatal("cannot create a fallback renderer: %s", SDL_GetError());""",
+    )
+    source = source.replace(
+        "        SDL_RenderPresent(renderer); // paced by vsync",
+        """        const bool presented = SDL_RenderPresent(renderer);
+        if (device && (vulkan_device_lost.load(std::memory_order_relaxed) ||
+                       (!presented && std::strstr(SDL_GetError(), "VK_ERROR_DEVICE_LOST"))))
+            fatal("Vulkan device lost during presentation (VK_ERROR_DEVICE_LOST). "
+                  "Set gpu_renderer=0 in userdata/settings.ini to retry with Direct3D 11.");""",
+    )
     return source
 
 
@@ -180,6 +229,47 @@ def filesystem(source):
     return source.replace('#include "service.h"', '#include "service.h"\n#include <SDL3/SDL.h>')
 
 def gpu(source):
+    source = source.replace("cmd = SDL_AcquireGPUCommandBuffer(dev);", "cmd = acquire_commands();")
+    source = source.replace("SDL_SubmitGPUCommandBuffer(cmd);", "submit_commands(cmd);")
+    download_comment = between(source, "// Copies a surface's image back into guest memory", "void download_surface")
+    source = source.replace(
+        download_comment,
+        """[[noreturn]] void gpu_failure(const char *operation) {
+    fatal("Vulkan %s failed: %s. Set gpu_renderer=0 in userdata/settings.ini to retry with Direct3D 11.",
+          operation, SDL_GetError());
+}
+
+SDL_GPUCommandBuffer *acquire_commands() {
+    auto *cmd = SDL_AcquireGPUCommandBuffer(dev);
+    if (!cmd) gpu_failure("command acquisition");
+    return cmd;
+}
+
+void submit_commands(SDL_GPUCommandBuffer *cmd) {
+    if (!SDL_SubmitGPUCommandBuffer(cmd)) gpu_failure("command submission");
+}
+
+""" + download_comment,
+    )
+    source = source.replace(
+        "    SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);\n    SDL_GPUTextureRegion src{};",
+        """    if (!tb) gpu_failure("readback allocation");
+    SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
+    SDL_GPUTextureRegion src{};""",
+        1,
+    )
+    source = source.replace(
+        "    SDL_WaitForGPUFences(dev, true, &fence, 1);",
+        """    if (!fence) gpu_failure("readback submission");
+    if (!SDL_WaitForGPUFences(dev, true, &fence, 1)) gpu_failure("readback wait");""",
+        1,
+    )
+    source = source.replace(
+        "    const auto *rgba = static_cast<const uint8_t *>(SDL_MapGPUTransferBuffer(dev, tb, false));",
+        """    const auto *rgba = static_cast<const uint8_t *>(SDL_MapGPUTransferBuffer(dev, tb, false));
+    if (!rgba) gpu_failure("readback mapping");""",
+        1,
+    )
     source = source.replace('#include "shaders.inc"', '#include "shaders.inc"\n#include "nsmb2_lcd.inc"')
     source = source.replace("SPIRV_blit_lcd_frag, sizeof SPIRV_blit_lcd_frag", "nsmb2_lcd, sizeof nsmb2_lcd")
     source = source.replace(
@@ -264,7 +354,7 @@ def gpu(source):
     source = source.replace(
         between(source, "    SDL_GPUTexture *tmp = make_texture(w, h", "    SDL_GPUTransferBufferCreateInfo tbi"),
         """    SDL_GPUTexture *image = s->tex;
-    SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(dev);
+    SDL_GPUCommandBuffer *cmd = acquire_commands();
     if (s->tw != w || s->th != h) {
         image = make_texture(w, h, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
                              SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET);

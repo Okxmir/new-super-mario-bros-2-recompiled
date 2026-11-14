@@ -17,6 +17,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <string_view>
 
@@ -27,6 +28,31 @@ size_t function_count() { return recomp_function_count; }
 
 namespace {
 constexpr uint64_t europe_title = 0x000400000007AF00;
+LONG WINAPI report_access_violation(EXCEPTION_POINTERS *info) {
+    const auto &record = *info->ExceptionRecord;
+    if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    HMODULE module = nullptr;
+    char path[MAX_PATH + 1]{};
+    const auto instruction = reinterpret_cast<uintptr_t>(record.ExceptionAddress);
+    const auto operation = record.ExceptionInformation[0];
+    const char *kind = operation == 0 ? "read" : operation == 1 ? "write" : operation == 8 ? "execute" : "access";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(instruction), &module) && GetModuleFileNameA(module, path, MAX_PATH)) {
+        const char *name = std::strrchr(path, '\\');
+        LOG("Windows access violation (0xc0000005): %s in %s+0x%llx", kind, name ? name + 1 : path,
+            static_cast<unsigned long long>(instruction - reinterpret_cast<uintptr_t>(module)));
+    } else {
+        LOG("Windows access violation (0xc0000005): %s outside a loaded module", kind);
+    }
+    uint32_t guest = 0;
+    if (recomp_mem && mem::guest_address(reinterpret_cast<void *>(record.ExceptionInformation[1]), &guest))
+        LOG("guest address: %08x", guest);
+    std::fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 constexpr std::array<uint8_t, 32> expected_code = {
     0x59, 0x60, 0x68, 0xed, 0xc3, 0x50, 0x8a, 0xa8, 0x82, 0x2c, 0xc3, 0x89, 0x46, 0x1b, 0x58, 0x5d,
     0x53, 0x08, 0x75, 0xb0, 0x2a, 0x66, 0x07, 0x0f, 0xc0, 0xaf, 0x25, 0xfe, 0x88, 0xe9, 0x8c, 0x94,
@@ -140,13 +166,16 @@ int verify_display_colors() {
 
 void play(const char *path) {
     const auto image = load(path);
+    LOG("startup: opening save storage");
     nsmb2::lock_save_directory(platform::state_dir());
+    LOG("startup: initializing the game kernel");
     kernel::init(image);
     kernel::run(image);
 }
 }
 
 int main(int argc, char **argv) {
+    SetUnhandledExceptionFilter(report_access_violation);
     if (argc == 2 && std::string_view(argv[1]) == "--verify-textures") return verify_texture_updates();
     if (argc == 2 && std::string_view(argv[1]) == "--verify-display-colors") return verify_display_colors();
     const bool verify = argc == 3 && std::string_view(argv[1]) == "--verify-startup";

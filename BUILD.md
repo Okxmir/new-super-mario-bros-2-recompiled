@@ -92,9 +92,11 @@ Open `dist/NewSuperMarioBros2.exe` in File Explorer, or run the following comman
 .\dist\NewSuperMarioBros2.exe
 ```
 
-Keep the executable and its companion files together in `dist`. On first launch, choose **Cancel** at the SpotPass prompt and dismiss any follow-up messages to start local solo play.
+Keep the executable and its companion files together in `dist`. The executable includes its Visual C++ runtime. On first launch, choose **Cancel** at the SpotPass prompt and dismiss any follow-up messages to start local solo play.
 
 User data lives under `dist/userdata`. The volume defaults to 25%. With the game closed, set `volume` to a value from 0 to 100 in `dist/userdata/settings.ini`. Vulkan is the default renderer. Set `gpu_renderer=0` in the same file for the software renderer with Direct3D 11 presentation.
+
+If Vulkan reports a lost device during play, try `gpu_renderer=0` and restart. When reporting a startup crash, include the log from the first `gpu:` line through the error. If present, include the `Windows access violation` line with its module name and offset.
 
 The Mii parts and shared font are generated locally by the pinned [system archive tools](https://github.com/B3n30/citra_system_archives/tree/f470e0c9d341db73b8a24880295d2eab4cd81660).
 

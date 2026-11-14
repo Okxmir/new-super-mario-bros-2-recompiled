@@ -4,11 +4,15 @@
 #include "pica_shader_flow.h"
 
 #include <array>
+#include <compare>
 #include <cstring>
+#include <deque>
 #include <intrin.h>
+#include <map>
 #include <memory>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #define XBYAK_NO_OP_NAMES
 #include <xbyak/xbyak.h>
@@ -16,14 +20,28 @@
 namespace pica {
 namespace {
 
-// Uniform control flow is resolved once per draw state. Vertex-dependent control flow
-// stays in the interpreter. Generated functions are leaf functions in the Win64 ABI.
+// Uniform decisions are resolved once per draw state. The compiler emits supported
+// vertex-dependent branches and falls back to the interpreter for other shaders.
+// Generated functions are leaf functions in the Win64 ABI.
 class VertexEmitter final : public Xbyak::CodeGenerator {
 public:
     VertexEmitter() : CodeGenerator(4096, Xbyak::AutoGrow) {}
 
-    bool compile(const ShaderSetup &shader, uint32_t entry) {
+    bool compile(const ShaderSetup &shader, uint32_t entry, bool graph = false) {
+        if (graph) {
+            if (!emit_graph(shader, entry)) return false;
+        } else if (!emit_specialized(shader, entry)) {
+            return false;
+        }
+        readyRE();
+        return FlushInstructionCache(GetCurrentProcess(), getCode(), getSize()) != 0;
+    }
+
+private:
+    bool emit_specialized(const ShaderSetup &shader, uint32_t entry) {
         auto emit = [&](uint32_t word, int32_t loop) {
+            if (!instructions_left) return false;
+            --instructions_left;
             loop_address = loop;
             const auto decoded = decode_arithmetic(word);
             return arithmetic(decoded, shader.swizzle[decoded.descriptor]);
@@ -34,16 +52,15 @@ public:
         };
         if (!specialize_vertex_program(shader, entry, emit, branch)) return false;
         ret();
-        readyRE();
-        return FlushInstructionCache(GetCurrentProcess(), getCode(), getSize()) != 0;
+        return true;
     }
 
-private:
     static_assert(sizeof(Vec4) == 16);
     std::array<bool, 16> initialized{};
     std::array<bool, 2> moved_address{};
     int32_t loop_address = 0;
     bool compared = false;
+    unsigned instructions_left = 4096;
 
     void splat_constant(const Xbyak::Xmm &dst, uint32_t bits) {
         mov(eax, bits);
@@ -136,37 +153,15 @@ private:
     }
 
     bool conditional(const ShaderSetup &shader, uint32_t word, uint32_t start, uint32_t alternate, uint32_t end) {
-        // Both paths may write temporaries and address registers. Give untouched registers
-        // their interpreter defaults before the split so either path can reach the join.
-        xorps(xmm5, xmm5);
-        for (unsigned i = 0; i < initialized.size(); ++i) {
-            if (!initialized[i]) movups(ptr[r9 + i * sizeof(Vec4)], xmm5);
-        }
-        initialized.fill(true);
-        if (!moved_address[0]) xor_(r10d, r10d);
-        if (!moved_address[1]) xor_(r11d, r11d);
-        moved_address.fill(true);
-        if (!compared) xorps(xmm4, xmm4);
-        compared = true;
-
+        prepare_branch_state();
         Xbyak::Label otherwise, done;
-        movmskps(eax, xmm4);
-        const uint32_t reference = ((word >> 25) & 1) | (((word >> 24) & 1) << 1);
-        if (reference) xor_(eax, reference);
-        switch ((word >> 22) & 3) {
-        case 0:
-            and_(eax, 3);
-            cmp(eax, 3);
-            je(otherwise, T_NEAR);
-            break;
-        case 1: test(eax, 3); jnz(otherwise, T_NEAR); break;
-        case 2: test(eax, 1); jnz(otherwise, T_NEAR); break;
-        case 3: test(eax, 2); jnz(otherwise, T_NEAR); break;
-        }
+        jump_on_condition(word, otherwise, false);
         auto emit_range = [&](uint32_t begin, uint32_t limit) {
             for (uint32_t pc = begin; pc < limit; ++pc) {
                 const auto ins = decode_arithmetic(shader.code[pc & 4095]);
                 const uint32_t op = ins.word >> 26;
+                if (!instructions_left) return false;
+                --instructions_left;
                 if (op == 0x21) continue;
                 if (op >= 0x20 && op < 0x2e) return false;
                 if (!arithmetic(ins, shader.swizzle[ins.descriptor])) return false;
@@ -179,6 +174,157 @@ private:
         if (!emit_range(alternate, end)) return false;
         L(done);
         return true;
+    }
+
+    void prepare_branch_state() {
+        // Both paths may write temporaries and address registers. Give untouched registers
+        // their interpreter defaults before the split so either path can reach the join.
+        xorps(xmm5, xmm5);
+        for (unsigned i = 0; i < initialized.size(); ++i) {
+            if (!initialized[i]) movups(ptr[r9 + i * sizeof(Vec4)], xmm5);
+        }
+        initialized.fill(true);
+        if (!moved_address[0]) xor_(r10d, r10d);
+        if (!moved_address[1]) xor_(r11d, r11d);
+        moved_address.fill(true);
+        if (!compared) xorps(xmm4, xmm4);
+        compared = true;
+    }
+
+    void jump_on_condition(uint32_t word, Xbyak::Label &target, bool when_true) {
+        movmskps(eax, xmm4);
+        const uint32_t reference = ((word >> 25) & 1) | (((word >> 24) & 1) << 1);
+        if (reference) xor_(eax, reference);
+        const unsigned mode = (word >> 22) & 3;
+        if (mode == 0) {
+            and_(eax, 3);
+            cmp(eax, 3);
+            if (when_true) jne(target, T_NEAR);
+            else je(target, T_NEAR);
+        } else {
+            test(eax, mode == 1 ? 3 : mode - 1);
+            if (when_true) jz(target, T_NEAR);
+            else jnz(target, T_NEAR);
+        }
+    }
+
+    struct FlowFrame {
+        uint32_t end, resume;
+        auto operator<=>(const FlowFrame &) const = default;
+    };
+
+    struct FlowState {
+        uint32_t pc;
+        size_t depth = 0;
+        std::array<FlowFrame, 16> frames{};
+        auto operator<=>(const FlowState &) const = default;
+
+        void resolve_returns() {
+            while (depth && pc == frames[depth - 1].end) {
+                pc = frames[depth - 1].resume;
+                frames[--depth] = {};
+            }
+        }
+
+        bool enter(uint32_t first, uint32_t end, uint32_t resume) {
+            if (depth == frames.size()) return false;
+            frames[depth++] = {end, resume};
+            pc = first;
+            return true;
+        }
+    };
+
+    // Compile control flow using the PICA return stack as part of the block key.
+    // A branch may jump over an enclosing block's end, as the interpreter allows.
+    bool emit_graph(const ShaderSetup &shader, uint32_t entry) {
+        prepare_branch_state();
+        struct Block {
+            FlowState state;
+            Xbyak::Label label;
+            std::vector<size_t> successors;
+        };
+        std::map<FlowState, size_t> indices;
+        std::deque<Block> blocks;
+        auto enqueue = [&](FlowState state) {
+            state.resolve_returns();
+            auto [it, added] = indices.try_emplace(state, blocks.size());
+            if (added) blocks.push_back({state, {}, {}});
+            return it->second;
+        };
+        enqueue(FlowState{entry});
+        for (size_t block_index = 0; block_index < blocks.size(); ++block_index) {
+            auto &block = blocks[block_index];
+            auto state = block.state;
+            const auto branch_target = [&](FlowState target) -> Xbyak::Label & {
+                const size_t next = enqueue(target);
+                block.successors.push_back(next);
+                return blocks[next].label;
+            };
+            L(block.label);
+            for (;;) {
+                if (!instructions_left) return false;
+                --instructions_left;
+                const uint32_t pc = state.pc++;
+                const uint32_t word = shader.code[pc & 4095], op = word >> 26;
+                const uint32_t count = word & 255, target = (word >> 10) & 4095;
+                const bool uniform = (shader.b >> ((word >> 22) & 15)) & 1;
+                if (op == 0x22) {
+                    ret();
+                    break;
+                }
+                if (op < 0x20 || op >= 0x2e) {
+                    const auto ins = decode_arithmetic(word);
+                    if (!arithmetic(ins, shader.swizzle[ins.descriptor])) return false;
+                } else if (op >= 0x24 && op <= 0x26) {
+                    if (op == 0x25) {
+                        auto taken = state;
+                        if (!taken.enter(target, target + count, state.pc)) return false;
+                        jump_on_condition(word, branch_target(taken), true);
+                    } else if (op == 0x24 || uniform) {
+                        if (!state.enter(target, target + count, state.pc)) return false;
+                    }
+                } else if (op == 0x27 || op == 0x28) {
+                    const uint32_t resume = target + count;
+                    if (target < state.pc) return false;
+                    if (op == 0x28) {
+                        auto otherwise = state;
+                        if (!otherwise.enter(target, resume, resume)) return false;
+                        jump_on_condition(word, branch_target(otherwise), false);
+                    }
+                    const bool taken = op == 0x28 || uniform;
+                    if (!state.enter(taken ? state.pc : target, taken ? target : resume, resume)) return false;
+                } else if (op == 0x2c || op == 0x2d) {
+                    if (target < state.pc) return false;
+                    if (op == 0x2c) {
+                        auto taken = state;
+                        taken.pc = target;
+                        jump_on_condition(word, branch_target(taken), true);
+                    } else if (uniform != bool(count & 1)) {
+                        state.pc = target;
+                    }
+                } else if (op != 0x21) {
+                    return false;
+                }
+                state.resolve_returns();
+                if (auto found = indices.find(state); found != indices.end()) {
+                    block.successors.push_back(found->second);
+                    jmp(blocks[found->second].label, T_NEAR);
+                    break;
+                }
+            }
+        }
+        // Reject cycles so generated code cannot run indefinitely on a shader
+        // where the interpreter would eventually stop at its instruction limit.
+        std::vector<size_t> incoming(blocks.size());
+        for (const auto &block : blocks)
+            for (size_t next : block.successors) ++incoming[next];
+        std::vector<size_t> ready;
+        for (size_t i = 0; i < incoming.size(); ++i)
+            if (!incoming[i]) ready.push_back(i);
+        for (size_t i = 0; i < ready.size(); ++i)
+            for (size_t next : blocks[ready[i]].successors)
+                if (!--incoming[next]) ready.push_back(next);
+        return ready.size() == blocks.size();
     }
 
     bool arithmetic(const ArithmeticInstruction &ins, uint32_t desc) {
@@ -232,6 +378,15 @@ private:
             case 0x02:
             case 0x03:
             case 0x18: dot(op); break;
+            case 0x04:
+            case 0x19: // DST
+                movaps(xmm5, xmm0);
+                multiply();
+                blendps(xmm0, xmm5, 4); // z comes from the first operand
+                blendps(xmm0, xmm1, 8); // w comes from the second operand
+                splat_constant(xmm5, 0x3f800000);
+                blendps(xmm0, xmm5, 1); // x is one
+                break;
             case 0x08: multiply(); break;
             case 0x09:
             case 0x1a: // SGE
@@ -314,7 +469,12 @@ CompiledVertex find_compiled_shader(const ShaderSetup &shader, uint32_t entry, u
     auto &compiled = cache[key];
     try {
         auto code = std::make_unique<VertexEmitter>();
-        if (code->compile(shader, entry)) compiled = std::move(code);
+        if (code->compile(shader, entry)) {
+            compiled = std::move(code);
+        } else {
+            code = std::make_unique<VertexEmitter>();
+            if (code->compile(shader, entry, true)) compiled = std::move(code);
+        }
     } catch (const Xbyak::Error &) {
         // The interpreter also works when Windows disallows executable allocations.
     }

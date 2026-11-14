@@ -393,6 +393,13 @@ def pica(source):
         // Generated code supplies zero for unwritten temporaries.
         Vec4 scratch[16];
         compiled(vs.f, in, out, scratch);
+        static const bool verify = std::getenv("NSMB2_VERIFY_VERTEX") != nullptr;
+        if (verify) {
+            Vec4 expected[16]{};
+            run_shader(vs, regs[VS_ENTRY] & 0xFFFF, in, expected);
+            if (std::memcmp(expected, out, sizeof out) != 0)
+                fatal("Vertex shader output differs at %#x", regs[VS_ENTRY] & 0xFFFF);
+        }
     } else {
         run_shader(vs, regs[VS_ENTRY] & 0xFFFF, in, out);
     }""")

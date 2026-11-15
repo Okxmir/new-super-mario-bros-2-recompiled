@@ -114,8 +114,82 @@ void SDLCALL capture_sdl_log(void *, int category, SDL_LogPriority priority, con
             fatal("cannot create a fallback renderer: %s", SDL_GetError());""",
     )
     source = source.replace(
+        '    LOG("window: %s renderer, %.2fx scale", SDL_GetRendererName(renderer), double(scale));',
+        '''    const SDL_DisplayMode *display = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window));
+    LOG("window: %s renderer, %.2fx scale, %.2f Hz", SDL_GetRendererName(renderer), double(scale),
+        display ? double(display->refresh_rate) : 0.0);
+    const bool log_presentation = std::getenv("NSMB2_FPS") != nullptr;
+    uint64_t presentation_since = SDL_GetTicksNS();
+    uint64_t longest_present = 0;
+    unsigned presentations = 0;''',
+    )
+    source = source.replace("#include <atomic>\n", "#include <atomic>\n#include <chrono>\n#include <condition_variable>\n")
+    source = source.replace("std::mutex frame_lock;",
+                            """std::mutex frame_lock;
+std::condition_variable frame_ready;
+bool lcd_present_pending = false;""")
+    source = source.replace(
+        "// a dump this executable can't play: hand it to the one that can, or say why not (false)",
+        """void finish_scanout() {
+    {
+        std::lock_guard lk(frame_lock);
+        lcd_present_pending = frame_dirty[0] || frame_dirty[1];
+    }
+    frame_ready.notify_one();
+}""")
+    source = source.replace(
+        "    auto show_message = [&](std::string text) { message = std::move(text), message_until = SDL_GetTicks() + 2500; };",
+        """    bool redraw_requested = true;
+    bool overlay_was_visible = false;
+    auto show_message = [&](std::string text) {
+        message = std::move(text);
+        message_until = SDL_GetTicks() + 2500;
+        redraw_requested = true;
+    };""")
+    source = source.replace("    auto relayout = [&] {\n", "    auto relayout = [&] {\n        redraw_requested = true;\n")
+    source = source.replace(
+        "        while (SDL_PollEvent(&e)) {\n",
+        """        while (SDL_PollEvent(&e)) {
+            if ((e.type >= SDL_EVENT_WINDOW_FIRST && e.type <= SDL_EVENT_WINDOW_LAST) ||
+                e.type == SDL_EVENT_RENDER_TARGETS_RESET)
+                redraw_requested = true;
+""")
+    source = source.replace(
+        """        {
+            std::lock_guard lk(frame_lock);
+            for (int i = 0; i < 2; i++) {""",
+        """        const bool show_overlay = !message.empty() && SDL_GetTicks() < message_until;
+        {
+            std::unique_lock lk(frame_lock);
+            if (!lcd_present_pending && !redraw_requested && show_overlay == overlay_was_visible) {
+                // Wake on the guest's next scanout. Revisit input and window events even when it is idle.
+                frame_ready.wait_for(lk, std::chrono::milliseconds(4), [] { return lcd_present_pending; });
+                continue;
+            }
+            lcd_present_pending = false;
+            redraw_requested = false;
+            overlay_was_visible = show_overlay;
+            for (int i = 0; i < 2; i++) {""")
+    source = source.replace("        if (!message.empty() && SDL_GetTicks() < message_until) {",
+                            "        if (show_overlay) {")
+    source = source.replace(
         "        SDL_RenderPresent(renderer); // paced by vsync",
-        """        const bool presented = SDL_RenderPresent(renderer);
+        """        const uint64_t present_start = log_presentation ? SDL_GetTicksNS() : 0;
+        const bool presented = SDL_RenderPresent(renderer);
+        if (log_presentation) {
+            const uint64_t now = SDL_GetTicksNS();
+            longest_present = std::max(longest_present, now - present_start);
+            presentations += presented;
+            const uint64_t elapsed = now - presentation_since;
+            if (elapsed >= 5 * SDL_NS_PER_SECOND) {
+                LOG("presentation: %.1f/s, longest call %.2f ms",
+                    double(presentations) * SDL_NS_PER_SECOND / double(elapsed),
+                    double(longest_present) / SDL_NS_PER_MS);
+                presentation_since = now;
+                longest_present = 0;
+                presentations = 0;
+            }
+        }
         if (device && (vulkan_device_lost.load(std::memory_order_relaxed) ||
                        (!presented && std::strstr(SDL_GetError(), "VK_ERROR_DEVICE_LOST"))))
             fatal("Vulkan device lost during presentation (VK_ERROR_DEVICE_LOST). "
@@ -840,7 +914,9 @@ def prepare(upstream, output):
     src = output / "src"
     edit(src / "frontend/sdl.cpp", frontend)
     edit(src / "frontend/frontend.h", lambda source: source.replace(
-        "const char *cli_dump, bool force_launcher, bool play", "const char *cli_dump"))
+        "const char *cli_dump, bool force_launcher, bool play", "const char *cli_dump").replace(
+        "// queues `frames` stereo", "// Signals that the LCD updates for one VBlank are ready.\n"
+        "void finish_scanout();\n\n// queues `frames` stereo"))
     edit(src / "frontend/games.h", lambda source: source.replace(
         'inline constexpr KnownDump KNOWN_DUMPS[] = {',
         'inline constexpr KnownDump KNOWN_DUMPS[] = {\n'
@@ -886,6 +962,8 @@ def prepare(upstream, output):
         "    romfs_offset_ = game.romfs_offset",
         "    exefs_files_ = std::move(game.exefs_files);\n    romfs_offset_ = game.romfs_offset"))
     edit(src / "hle/gsp.cpp", lambda source: source.replace(
+        "            present();\n            raise(PDC0);",
+        "            present();\n            frontend::finish_scanout();\n            raise(PDC0);").replace(
         "    void set_buffer(uint32_t screen, const uint32_t *info) {",
         "    void set_buffer(uint32_t screen, const uint32_t *info) {").replace(
         "        lcd[screen] = {info[1], info[3], info[4]};",

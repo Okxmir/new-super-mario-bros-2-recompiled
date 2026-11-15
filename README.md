@@ -18,7 +18,7 @@ Experimental native Windows x64 port of the European Nintendo 3DS release (`CTR-
 
 Use `-Language fr` to play in French. See [BUILD.md](BUILD.md) for all eight languages and the manual build steps. [PROGRESS.md](PROGRESS.md) lists the features tested so far.
 
-In windowed mode, open **Resolution** below the window title to choose **1×**, **2×**, or **4×** rendering. The menu follows the game language. Your choice is saved in `userdata/settings.ini` and restored on the next launch.
+In windowed mode, open **Upscaling** below the window title to choose **1×**, **2×**, or **4×** rendering. Your choice is saved in `userdata/settings.ini` and restored on the next launch.
 
 ## Default controls
 

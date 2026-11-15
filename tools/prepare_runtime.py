@@ -16,6 +16,7 @@ def edit(path, transform):
 
 def frontend(source):
     source = source.replace('#include "handoff.h"\n', '').replace('#include "launcher.h"\n', '')
+    source = source.replace('#include "settings.h"\n', '#include "settings.h"\n#include "resolution_menu.h"\n')
     source = source.replace(between(source, "bool hand_off_or_explain", "void run(void (*start)"), "")
     source = source.replace("const char *cli_dump, bool force_launcher, bool play", "const char *cli_dump")
     source = source.replace(
@@ -34,7 +35,32 @@ def frontend(source):
     source = source.replace(
         "    SDL_SetWindowFullscreen(window, s.fullscreen); // the game's own choice, whatever the launcher was",
         "    if (s.fullscreen) SDL_SetWindowFullscreen(window, true);\n"
+        "    ResolutionMenu resolution_menu(window, s);\n"
+        "    resolution_menu.set_visible(!(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN));\n"
         "    SDL_RaiseWindow(window);")
+    source = source.replace(
+        """                    s.fullscreen = !(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN);
+                    SDL_SetWindowFullscreen(window, s.fullscreen);
+                    s.save();""",
+        """                    const bool fullscreen = !(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN);
+                    if (fullscreen) resolution_menu.set_visible(false);
+                    SDL_SetWindowFullscreen(window, fullscreen);
+                    s.fullscreen = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
+                    resolution_menu.set_visible(!s.fullscreen);
+                    s.save();""")
+    source = source.replace("    pica::set_resolution_scale(s.resolution);",
+                            "    pica::set_resolution_scale(s.resolution);\n"
+                            '    LOG("graphics: resolution %dx", std::clamp(s.resolution, 1, 4));')
+    source = source.replace(
+        "void present_gpu(int screen, SDL_GPUTexture *texture, int width, int height) {\n    if (screen == 0) {",
+        """void present_gpu(int screen, SDL_GPUTexture *texture, int width, int height) {
+    if (screen == 0) {
+        static int logged_width = 0, logged_height = 0;
+        static const bool log_resolution = std::getenv("NSMB2_FPS") != nullptr;
+        if (log_resolution && (width != logged_width || height != logged_height)) {
+            LOG("graphics: Vulkan output %dx%d", width, height);
+            logged_width = width, logged_height = height;
+        }""")
     source = source.replace("    fatal_hook = show_fatal;",
                             '    if (!std::getenv("NSMB2_NO_DIALOG")) fatal_hook = show_fatal;')
     source = source.replace(
@@ -303,6 +329,52 @@ def filesystem(source):
     return source.replace('#include "service.h"', '#include "service.h"\n#include <SDL3/SDL.h>')
 
 def gpu(source):
+    source = source.replace("#include <algorithm>\n", "#include <algorithm>\n#include <array>\n")
+    source = source.replace(
+        "std::vector<std::unique_ptr<Surface>> surfaces;",
+        "std::vector<std::unique_ptr<Surface>> surfaces;\nint render_scale = 1, render_margin = 0;")
+    source = source.replace(
+        "    int margin, scale;\n    requested_enhancement(&margin, &scale);",
+        "    int margin = render_margin;\n    const int scale = render_scale;")
+    source = source.replace(
+        "void begin_list() {\n    list_hashes.clear();",
+        """void begin_list() {
+    list_hashes.clear();
+    int scale;
+    requested_enhancement(&render_margin, &scale);
+    if (scale != render_scale) {
+        // Preserve guest-visible color buffers before rebuilding targets at the new size.
+        for (const auto &s : surfaces) {
+            if (!s->depth && s->drawn && !s->reload && !overwritten(s.get()))
+                download_surface(s.get());
+        }
+        release_twins();
+        for (const auto &s : surfaces) SDL_ReleaseGPUTexture(dev, s->tex);
+        surfaces.clear();
+        last_frame.clear();
+        this_frame.clear();
+        interp_this = false;
+        render_scale = scale;
+    }""")
+    # A window renderer texture wraps the LCD's GPU texture. Keep each of the bounded
+    # render sizes available so another thread's current frame stays valid on a switch.
+    for count in (3, 8):
+        source = source.replace(
+            f"    SDL_GPUTexture *tex[{count}] = {{}};",
+            f"    std::array<SDL_GPUTexture *, {count}> tex{{}};\n"
+            f"    std::map<std::pair<int, int>, std::array<SDL_GPUTexture *, {count}>> sizes;")
+    for frame in ("f", "q"):
+        indent = "        " if frame == "f" else "            "
+        source = source.replace(
+            f"{indent}for (auto *t : {frame}.tex)\n{indent}    if (t) SDL_ReleaseGPUTexture(dev, t);\n"
+            f"{indent}for (auto *&t : {frame}.tex)\n{indent}    t = make_texture(uint32_t(w), uint32_t(h), SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,\n"
+            f"{indent}                     SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);",
+            f"{indent}auto &textures_at_size = {frame}.sizes[{{w, h}}];\n"
+            f"{indent}if (!textures_at_size[0]) {{\n"
+            f"{indent}    for (auto *&t : textures_at_size)\n"
+            f"{indent}        t = make_texture(uint32_t(w), uint32_t(h), SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,\n"
+            f"{indent}                         SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);\n"
+            f"{indent}}}\n{indent}{frame}.tex = textures_at_size;")
     source = source.replace("cmd = SDL_AcquireGPUCommandBuffer(dev);", "cmd = acquire_commands();")
     source = source.replace("SDL_SubmitGPUCommandBuffer(cmd);", "submit_commands(cmd);")
     download_comment = between(source, "// Copies a surface's image back into guest memory", "void download_surface")

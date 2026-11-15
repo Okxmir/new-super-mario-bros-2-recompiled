@@ -153,13 +153,15 @@ void SDLCALL capture_sdl_log(void *, int category, SDL_LogPriority priority, con
     source = source.replace("std::mutex frame_lock;",
                             """std::mutex frame_lock;
 std::condition_variable frame_ready;
-bool lcd_present_pending = false;""")
+bool lcd_present_pending = false;
+std::vector<SDL_GPUTexture *> retired_gpu_frames;""")
     source = source.replace(
         "// a dump this executable can't play: hand it to the one that can, or say why not (false)",
-        """void finish_scanout() {
+        """void finish_scanout(const std::vector<SDL_GPUTexture *> &retired) {
     {
         std::lock_guard lk(frame_lock);
-        lcd_present_pending = frame_dirty[0] || frame_dirty[1];
+        retired_gpu_frames.insert(retired_gpu_frames.end(), retired.begin(), retired.end());
+        lcd_present_pending = frame_dirty[0] || frame_dirty[1] || !retired_gpu_frames.empty();
     }
     frame_ready.notify_one();
 }""")
@@ -195,6 +197,25 @@ bool lcd_present_pending = false;""")
             lcd_present_pending = false;
             redraw_requested = false;
             overlay_was_visible = show_overlay;
+            // The display thread owns the SDL wrappers. Remove them before releasing
+            // the GPU textures they wrap, after the previous window frame was submitted.
+            for (auto *texture : retired_gpu_frames) {
+                auto it = wrapped.find(texture);
+                for (int i = 0; i < 2; ++i) {
+                    if (gpu_frame[i] == texture) {
+                        gpu_frame[i] = nullptr;
+                        frame_dirty[i] = false;
+                    }
+                    if (it != wrapped.end() && shown_gpu[i] == it->second.tex)
+                        shown_gpu[i] = nullptr;
+                }
+                if (it != wrapped.end()) {
+                    if (it->second.tex) SDL_DestroyTexture(it->second.tex);
+                    wrapped.erase(it);
+                }
+                SDL_ReleaseGPUTexture(device, texture);
+            }
+            retired_gpu_frames.clear();
             for (int i = 0; i < 2; i++) {""")
     source = source.replace("        if (!message.empty() && SDL_GetTicks() < message_until) {",
                             "        if (show_overlay) {")
@@ -329,7 +350,6 @@ def filesystem(source):
     return source.replace('#include "service.h"', '#include "service.h"\n#include <SDL3/SDL.h>')
 
 def gpu(source):
-    source = source.replace("#include <algorithm>\n", "#include <algorithm>\n#include <array>\n")
     source = source.replace(
         "std::vector<std::unique_ptr<Surface>> surfaces;",
         "std::vector<std::unique_ptr<Surface>> surfaces;\nint render_scale = 1, render_margin = 0;")
@@ -356,25 +376,25 @@ def gpu(source):
         interp_this = false;
         render_scale = scale;
     }""")
-    # A window renderer texture wraps the LCD's GPU texture. Keep each of the bounded
-    # render sizes available so another thread's current frame stays valid on a switch.
-    for count in (3, 8):
-        source = source.replace(
-            f"    SDL_GPUTexture *tex[{count}] = {{}};",
-            f"    std::array<SDL_GPUTexture *, {count}> tex{{}};\n"
-            f"    std::map<std::pair<int, int>, std::array<SDL_GPUTexture *, {count}>> sizes;")
+    source = source.replace("SDL_Mutex *lcd_lock;",
+                            "SDL_Mutex *lcd_lock;\nstd::vector<SDL_GPUTexture *> retired_scanouts;")
     for frame in ("f", "q"):
         indent = "        " if frame == "f" else "            "
         source = source.replace(
-            f"{indent}for (auto *t : {frame}.tex)\n{indent}    if (t) SDL_ReleaseGPUTexture(dev, t);\n"
-            f"{indent}for (auto *&t : {frame}.tex)\n{indent}    t = make_texture(uint32_t(w), uint32_t(h), SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,\n"
-            f"{indent}                     SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);",
-            f"{indent}auto &textures_at_size = {frame}.sizes[{{w, h}}];\n"
-            f"{indent}if (!textures_at_size[0]) {{\n"
-            f"{indent}    for (auto *&t : textures_at_size)\n"
-            f"{indent}        t = make_texture(uint32_t(w), uint32_t(h), SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,\n"
-            f"{indent}                         SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);\n"
-            f"{indent}}}\n{indent}{frame}.tex = textures_at_size;")
+            f"{indent}for (auto *t : {frame}.tex)\n{indent}    if (t) SDL_ReleaseGPUTexture(dev, t);",
+            f"{indent}for (auto *t : {frame}.tex)\n{indent}    if (t) retired_scanouts.push_back(t);")
+    source = source.replace(
+        "SDL_GPUTexture *lcd_frame(uint32_t addr, int *width, int *height) {",
+        """std::vector<SDL_GPUTexture *> take_retired_scanouts() {
+    std::vector<SDL_GPUTexture *> result;
+    if (!ok) return result;
+    SDL_LockMutex(lcd_lock);
+    result.swap(retired_scanouts);
+    SDL_UnlockMutex(lcd_lock);
+    return result;
+}
+
+SDL_GPUTexture *lcd_frame(uint32_t addr, int *width, int *height) {""")
     source = source.replace("cmd = SDL_AcquireGPUCommandBuffer(dev);", "cmd = acquire_commands();")
     source = source.replace("SDL_SubmitGPUCommandBuffer(cmd);", "submit_commands(cmd);")
     download_comment = between(source, "// Copies a surface's image back into guest memory", "void download_surface")
@@ -392,7 +412,24 @@ SDL_GPUCommandBuffer *acquire_commands() {
 }
 
 void submit_commands(SDL_GPUCommandBuffer *cmd) {
-    if (!SDL_SubmitGPUCommandBuffer(cmd)) gpu_failure("command submission");
+    // SDL Vulkan normally reclaims submissions when the window presents. Windows
+    // can block that thread in a menu or resize loop while the game keeps rendering.
+    // Retire completed batches independently and cap how far the producer can run ahead.
+    static constexpr unsigned submissions_per_fence = 64;
+    static unsigned submissions = 0;
+    static SDL_GPUFence *previous_fence = nullptr;
+    if (++submissions < submissions_per_fence) {
+        if (!SDL_SubmitGPUCommandBuffer(cmd)) gpu_failure("command submission");
+        return;
+    }
+    submissions = 0;
+    SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+    if (!fence) gpu_failure("command submission");
+    if (previous_fence) {
+        if (!SDL_WaitForGPUFences(dev, true, &previous_fence, 1)) gpu_failure("command retirement");
+        SDL_ReleaseGPUFence(dev, previous_fence);
+    }
+    previous_fence = fence;
 }
 
 """ + download_comment,
@@ -987,8 +1024,12 @@ def prepare(upstream, output):
     edit(src / "frontend/sdl.cpp", frontend)
     edit(src / "frontend/frontend.h", lambda source: source.replace(
         "const char *cli_dump, bool force_launcher, bool play", "const char *cli_dump").replace(
+        "#include <cstdint>", "#include <cstdint>\n#include <vector>").replace(
         "// queues `frames` stereo", "// Signals that the LCD updates for one VBlank are ready.\n"
-        "void finish_scanout();\n\n// queues `frames` stereo"))
+        "void finish_scanout(const std::vector<SDL_GPUTexture *> &retired);\n\n// queues `frames` stereo"))
+    edit(src / "video/gpu/gpu.h", lambda source: source.replace(
+        "#include <cstdint>", "#include <cstdint>\n#include <vector>").replace(
+        "SDL_GPUTexture *lcd_frame(", "std::vector<SDL_GPUTexture *> take_retired_scanouts();\nSDL_GPUTexture *lcd_frame("))
     edit(src / "frontend/games.h", lambda source: source.replace(
         'inline constexpr KnownDump KNOWN_DUMPS[] = {',
         'inline constexpr KnownDump KNOWN_DUMPS[] = {\n'
@@ -1035,7 +1076,12 @@ def prepare(upstream, output):
         "    exefs_files_ = std::move(game.exefs_files);\n    romfs_offset_ = game.romfs_offset"))
     edit(src / "hle/gsp.cpp", lambda source: source.replace(
         "            present();\n            raise(PDC0);",
-        "            present();\n            frontend::finish_scanout();\n            raise(PDC0);").replace(
+        """            // Collect old scanouts before reading the current LCD textures. A
+            // texture retired later remains alive until we publish again.
+            auto retired = pica::gpu::take_retired_scanouts();
+            present();
+            frontend::finish_scanout(retired);
+            raise(PDC0);""").replace(
         "    void set_buffer(uint32_t screen, const uint32_t *info) {",
         "    void set_buffer(uint32_t screen, const uint32_t *info) {").replace(
         "        lcd[screen] = {info[1], info[3], info[4]};",
